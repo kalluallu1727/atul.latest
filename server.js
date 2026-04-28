@@ -155,7 +155,7 @@ function customerConferenceTwiml(callId) {
   <Dial>
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-                statusCallbackEvent="end"
+                statusCallbackEvent="join end"
                 statusCallback="${statusUrl}">
       ${room}
     </Conference>
@@ -164,9 +164,8 @@ function customerConferenceTwiml(callId) {
 }
 
 function agentConferenceTwiml(callId) {
-  const transcriptionUrl   = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const recordingStatusUrl = escapeXml(`${BASE_URL}/api/twilio/recording-status?call_id=${callId}`);
-  const room               = `room-${callId}`;
+  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const room             = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -176,11 +175,7 @@ function agentConferenceTwiml(callId) {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl=""
-                record="record-from-start"
-                recordingStatusCallback="${recordingStatusUrl}"
-                recordingStatusCallbackMethod="POST"
-                recordingStatusCallbackEvent="completed absent failed">
+    <Conference beep="false" waitUrl="">
       ${room}
     </Conference>
   </Dial>
@@ -769,10 +764,13 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
 </Response>`);
 });
 
-// -- Conference status callback (called when conference ends) -
-app.post("/api/conference-status", (req, res) => {
-  const callId = String(req.query.call_id || "").trim();
-  const event  = req.body.StatusCallbackEvent;
+// -- Conference status callback (called on join and end events) -
+app.post("/api/conference-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId        = String(req.query.call_id        || "").trim();
+  const event         = String(req.body.StatusCallbackEvent || "").trim();
+  const conferenceSid = String(req.body.ConferenceSid   || "").trim();
 
   if (event === "conference-end" && callId) {
     console.log(`[conference-status] Conference ended callId=${callId}`);
@@ -784,7 +782,42 @@ app.post("/api/conference-status", (req, res) => {
       });
   }
 
-  res.status(200).end();
+  // When a participant joins, check if both agent and customer are present.
+  // If so, start a conference recording via the REST API so we capture real audio.
+  if (event === "participant-join" && callId && conferenceSid && twilioClient) {
+    try {
+      const participants = await twilioClient
+        .conferences(conferenceSid)
+        .participants.list({ limit: 10 });
+
+      if (participants.length < 2) return; // Wait until both parties are connected
+
+      // Prevent duplicate recordings for this call
+      const { data: existing } = await supabase
+        .from("recordings")
+        .select("id")
+        .eq("call_id", callId)
+        .maybeSingle();
+      if (existing) return;
+
+      const recording = await twilioClient
+        .conferences(conferenceSid)
+        .recordings.create({
+          recordingStatusCallback:       `${BASE_URL}/api/twilio/recording-status?call_id=${callId}`,
+          recordingStatusCallbackMethod: "POST",
+        });
+
+      console.log(`[recording] Conference recording started ✓ sid=${recording.sid} callId=${callId}`);
+
+      await supabase.from("recordings").upsert({
+        call_id:       callId,
+        recording_sid: recording.sid,
+        status:        "in-progress",
+      }, { onConflict: "recording_sid" });
+    } catch (err) {
+      console.error("[recording] Auto-start error:", err.message);
+    }
+  }
 });
 
 // -- Fetch customer's recent bills from DB (graceful — works even if table missing) --
