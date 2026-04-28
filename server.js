@@ -156,7 +156,8 @@ function customerConferenceTwiml(callId) {
     <Conference beep="false"
                 waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
                 statusCallbackEvent="join end"
-                statusCallback="${statusUrl}">
+                statusCallback="${statusUrl}"
+                endConferenceOnExit="true">
       ${room}
     </Conference>
   </Dial>
@@ -175,7 +176,7 @@ function agentConferenceTwiml(callId) {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl="">
+    <Conference beep="false" waitUrl="" endConferenceOnExit="true">
       ${room}
     </Conference>
   </Dial>
