@@ -164,8 +164,9 @@ function customerConferenceTwiml(callId) {
 }
 
 function agentConferenceTwiml(callId) {
-  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const room             = `room-${callId}`;
+  const transcriptionUrl   = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const recordingStatusUrl = escapeXml(`${BASE_URL}/api/twilio/recording-status?call_id=${callId}`);
+  const room               = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -175,7 +176,11 @@ function agentConferenceTwiml(callId) {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl="">
+    <Conference beep="false" waitUrl=""
+                record="record-from-start"
+                recordingStatusCallback="${recordingStatusUrl}"
+                recordingStatusCallbackMethod="POST"
+                recordingStatusCallbackEvent="completed absent failed">
       ${room}
     </Conference>
   </Dial>
@@ -596,7 +601,7 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
       statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}`,
       statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
       statusCallbackMethod: "POST",
-      timeout: 30,
+      timeout: 15,
     }).then((call) => {
       console.log(`[ivr-query] Agent call created ✓ SID=${call.sid} identity=${agentIdentity}`);
     }).catch((err) => {
@@ -1117,7 +1122,7 @@ app.post("/api/twilio/agent-status", async (req, res) => {
       statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=agent_general`,
       statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
       statusCallbackMethod: "POST",
-      timeout: 30,
+      timeout: 15,
     }).then((call) => {
       console.log(`[agent-status] Fallback agent call created ✓ SID=${call.sid}`);
     }).catch((err) => {
@@ -1128,6 +1133,59 @@ app.post("/api/twilio/agent-status", async (req, res) => {
     // General pool also failed — no agents available at all
     console.log(`[agent-status] No agents available — redirecting customer callId=${callId}`);
     redirectCustomerToNoAgentMessage(callId);
+  }
+});
+
+// -- Recording status callback (Twilio fires when conference recording completes) --
+app.post("/api/twilio/recording-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId       = String(req.query.call_id            || "").trim();
+  const sid          = String(req.body.RecordingSid         || "").trim();
+  const status       = String(req.body.RecordingStatus      || "").trim();
+  const duration     = parseInt(req.body.RecordingDuration  || "0", 10);
+  const recordingUrl = String(req.body.RecordingUrl         || "").trim();
+
+  if (!callId || !sid) {
+    console.warn("[recording-status] Missing callId or RecordingSid — ignoring");
+    return;
+  }
+
+  console.log(`[recording] callId=${callId} sid=${sid} status=${status} duration=${isNaN(duration) ? "?" : duration}s`);
+
+  const { error } = await supabase.from("recordings").upsert({
+    call_id:          callId,
+    recording_sid:    sid,
+    recording_url:    recordingUrl || null,
+    duration_seconds: isNaN(duration) ? null : duration,
+    status,
+    completed_at:     status === "completed" ? new Date().toISOString() : null,
+  }, { onConflict: "recording_sid" });
+
+  if (error) console.error("[recording] Save error:", error.message);
+  else console.log(`[recording] ${status} recording saved ✓ sid=${sid}`);
+});
+
+// -- Stream a Twilio recording to the browser (proxies with Basic Auth) --
+app.get("/api/recordings/stream/:sid", async (req, res) => {
+  const { sid } = req.params;
+  if (!sid || !sid.startsWith("RE")) return res.status(404).end();
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return res.status(503).end();
+
+  const url  = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Recordings/${sid}.mp3`;
+  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+
+  try {
+    const upstream = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+    if (!upstream.ok) return res.status(upstream.status).end();
+    const buffer = await upstream.arrayBuffer();
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", buffer.byteLength);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.end(Buffer.from(buffer));
+  } catch (err) {
+    console.error("[recording-stream] Error:", err.message);
+    if (!res.headersSent) res.status(502).end();
   }
 });
 
