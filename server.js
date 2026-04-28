@@ -358,6 +358,32 @@ function departmentToAgentIdentity(department) {
   return deptMap[department] || "agent_general";
 }
 
+// Redirects every participant in a waiting conference to the
+// "no agents available" TwiML endpoint.
+async function redirectCustomerToNoAgentMessage(callId) {
+  if (!twilioClient) return;
+  try {
+    const conferences = await twilioClient.conferences.list({
+      friendlyName: `room-${callId}`,
+      status: "in-progress",
+      limit: 1,
+    });
+    if (!conferences.length) return;
+    const participants = await twilioClient
+      .conferences(conferences[0].sid)
+      .participants.list({ limit: 20 });
+    for (const p of participants) {
+      await twilioClient.calls(p.callSid).update({
+        url:    `${BASE_URL}/api/twilio/no-agent-available`,
+        method: "POST",
+      });
+    }
+    console.log(`[no-agent] Customer redirected for callId=${callId}`);
+  } catch (err) {
+    console.error("[no-agent] Redirect error:", err.message);
+  }
+}
+
 app.get("/", (_req, res) => res.send("Agent-assist IVR server running."));
 
 // -- Twilio Access Token for agent browser softphone ----------
@@ -567,6 +593,10 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
       to:   `client:${agentIdentity}`,
       from: TWILIO_PHONE_NUMBER,
       url:  agentUrl,
+      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=${agentIdentity}`,
+      statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
+      statusCallbackMethod: "POST",
+      timeout: 30,
     }).then((call) => {
       console.log(`[ivr-query] Agent call created ✓ SID=${call.sid} identity=${agentIdentity}`);
     }).catch((err) => {
@@ -1060,6 +1090,56 @@ async function fetchCustomerDetails(req, res, overrides = {}) {
 
 app.get("/api/customer-details", (req, res) => fetchCustomerDetails(req, res));
 app.get("/api/customers/:id",    (req, res) => fetchCustomerDetails(req, res, { id: req.params.id }));
+
+// -- Agent dial status callback (fired when agent call ends/fails) -
+// Handles no-answer/busy/failed by first trying the general pool,
+// then redirecting the waiting customer if still no one picks up.
+app.post("/api/twilio/agent-status", async (req, res) => {
+  res.status(200).end();
+
+  const callId   = String(req.query.call_id  || "").trim();
+  const identity = String(req.query.identity || "").trim();
+  const status   = String(req.body.CallStatus || "").trim();
+
+  console.log(`[agent-status] callId=${callId} identity=${identity} status=${status}`);
+
+  if (!callId || !twilioClient) return;
+  if (!["no-answer", "busy", "failed"].includes(status)) return;
+
+  if (identity !== "agent_general") {
+    // First failure — try the general pool as a fallback
+    console.log(`[agent-status] No answer from ${identity} — trying agent_general`);
+    const fallbackUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+    twilioClient.calls.create({
+      to:   "client:agent_general",
+      from: TWILIO_PHONE_NUMBER,
+      url:  fallbackUrl,
+      statusCallback:       `${BASE_URL}/api/twilio/agent-status?call_id=${callId}&identity=agent_general`,
+      statusCallbackEvent:  ["completed", "no-answer", "busy", "failed"],
+      statusCallbackMethod: "POST",
+      timeout: 30,
+    }).then((call) => {
+      console.log(`[agent-status] Fallback agent call created ✓ SID=${call.sid}`);
+    }).catch((err) => {
+      console.error(`[agent-status] Fallback dial FAILED: ${err.message}`);
+      redirectCustomerToNoAgentMessage(callId);
+    });
+  } else {
+    // General pool also failed — no agents available at all
+    console.log(`[agent-status] No agents available — redirecting customer callId=${callId}`);
+    redirectCustomerToNoAgentMessage(callId);
+  }
+});
+
+// -- No-agent TwiML (played to customer when no agent answers) -
+app.post("/api/twilio/no-agent-available", (_req, res) => {
+  res.set("Content-Type", "text/xml");
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">We are sorry, but all agents are currently unavailable. Please call back during business hours or visit our website for assistance. Thank you for calling BrightSuite.</Say>
+  <Hangup/>
+</Response>`);
+});
 
 // ── Start server ──────────────────────────────────────────────
 function startServer(p) {
