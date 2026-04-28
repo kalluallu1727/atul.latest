@@ -1,42 +1,36 @@
-import { createServerClient } from "@supabase/ssr";
-import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
+const { createClient } = require("@supabase/supabase-js");
 
-const PUBLIC_PATHS = ["/login", "/register", "/auth/callback"];
+let _adminClient = null;
 
-export async function middleware(req: NextRequest) {
-  const res = NextResponse.next({ request: { headers: req.headers } });
-
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        get: (name) => req.cookies.get(name)?.value,
-        set: (name, value, options) => res.cookies.set({ name, value, ...options }),
-        remove: (name, options) => res.cookies.set({ name, value: "", ...options }),
-      },
-    }
-  );
-
-  const { data: { session } } = await supabase.auth.getSession();
-  const { pathname } = req.nextUrl;
-
-  const isPublic = PUBLIC_PATHS.some((p) => pathname.startsWith(p));
-
-  if (!session && !isPublic) {
-    return NextResponse.redirect(new URL("/login", req.url));
+function getAdminClient() {
+  if (!_adminClient) {
+    _adminClient = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY,
+      { auth: { autoRefreshToken: false, persistSession: false } }
+    );
   }
-
-  if (session && (pathname === "/login" || pathname === "/register")) {
-    return NextResponse.redirect(new URL("/", req.url));
-  }
-
-  return res;
+  return _adminClient;
 }
 
-export const config = {
-  // Only protect page routes. Exclude static assets and all /api/* routes
-  // so existing Twilio/IVR API endpoints continue to work without auth headers.
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|api/).*)"],
-};
+// Middleware: requires a valid Supabase Bearer token in Authorization header.
+// Attaches req.user (Supabase auth user) on success.
+// Apply to any route that should only be accessible to authenticated agents.
+async function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized: missing token" });
+  }
+
+  const token = authHeader.slice(7);
+  const { data: { user }, error } = await getAdminClient().auth.getUser(token);
+
+  if (error || !user) {
+    return res.status(401).json({ error: "Unauthorized: invalid or expired token" });
+  }
+
+  req.user = user;
+  next();
+}
+
+module.exports = { requireAuth };
