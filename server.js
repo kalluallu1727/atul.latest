@@ -332,12 +332,63 @@ async function runAnalysisPipeline(callId, transcript) {
 
 // ── Routes ────────────────────────────────────────────────────
 
+// ── Department-based routing helpers ─────────────────────────
+// Maps the IVR category chosen by the customer to the Twilio
+// client identity of the correct department agent pool.
+function categoryToAgentIdentity(category) {
+  const map = {
+    billing:   "agent_billing",
+    new_lines: "agent_support",
+    service:   "agent_support",
+    general:   "agent_general",
+  };
+  return map[category] || "agent_general";
+}
+
+// Maps the department stored in the agents table to the same
+// Twilio client identity, so each agent registers under the right pool.
+function departmentToAgentIdentity(department) {
+  const deptMap = {
+    "Billing":           "agent_billing",
+    "Technical Support": "agent_support",
+    "Sales":             "agent_support",
+    "Customer Success":  "agent_support",
+    "General":           "agent_general",
+  };
+  return deptMap[department] || "agent_general";
+}
+
 app.get("/", (_req, res) => res.send("Agent-assist IVR server running."));
 
 // -- Twilio Access Token for agent browser softphone ----------
-app.get("/api/token", (_req, res) => {
+// Accepts an optional Bearer token (Supabase JWT) to derive the
+// agent's department and assign the correct Twilio client identity.
+// Falls back to "agent_general" if no auth header is present.
+app.get("/api/token", async (req, res) => {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET) {
     return res.status(503).json({ error: "Twilio credentials not configured." });
+  }
+
+  let agentIdentity = "agent_general";
+
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    try {
+      const bearerToken = authHeader.slice(7);
+      const { data: { user } } = await supabase.auth.getUser(bearerToken);
+      if (user) {
+        const { data: agent } = await supabase
+          .from("agents")
+          .select("department")
+          .eq("auth_user_id", user.id)
+          .single();
+        if (agent?.department) {
+          agentIdentity = departmentToAgentIdentity(agent.department);
+        }
+      }
+    } catch (e) {
+      console.warn("[token] Could not resolve agent department:", e.message);
+    }
   }
 
   const AccessToken = twilio.jwt.AccessToken;
@@ -347,7 +398,7 @@ app.get("/api/token", (_req, res) => {
     TWILIO_ACCOUNT_SID,
     TWILIO_API_KEY,
     TWILIO_API_SECRET,
-    { identity: "agent", ttl: 3600 }
+    { identity: agentIdentity, ttl: 3600 }
   );
 
   const voiceGrant = new VoiceGrant({
@@ -356,7 +407,8 @@ app.get("/api/token", (_req, res) => {
   });
 
   token.addGrant(voiceGrant);
-  return res.json({ token: token.toJwt() });
+  console.log(`[token] Issued Twilio token → identity="${agentIdentity}"`);
+  return res.json({ token: token.toJwt(), identity: agentIdentity });
 });
 
 // -- Customer calls in → IVR greeting + menu -----------------
@@ -505,16 +557,18 @@ app.post("/api/twilio/ivr-query", async (req, res) => {
       .then(({ error }) => { if (error) console.error("[ivr-query] Call update:", error.message); });
   }
 
-  // Dial the agent browser now that the customer is ready to talk
+  // Dial the agent browser now that the customer is ready to talk.
+  // Routes to the department pool that matches the customer's IVR choice.
   if (twilioClient && TWILIO_PHONE_NUMBER && callId) {
-    const agentUrl = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
-    console.log(`[ivr-query] Dialling agent → client:agent`);
+    const agentIdentity = categoryToAgentIdentity(category);
+    const agentUrl      = `${BASE_URL}/api/twilio/agent?call_id=${callId}`;
+    console.log(`[ivr-query] Dialling agent → client:${agentIdentity} (category=${category})`);
     twilioClient.calls.create({
-      to:   "client:agent",
+      to:   `client:${agentIdentity}`,
       from: TWILIO_PHONE_NUMBER,
       url:  agentUrl,
     }).then((call) => {
-      console.log(`[ivr-query] Agent call created ✓ SID=${call.sid}`);
+      console.log(`[ivr-query] Agent call created ✓ SID=${call.sid} identity=${agentIdentity}`);
     }).catch((err) => {
       console.error(`[ivr-query] Agent dial FAILED: ${err.message}`);
     });
