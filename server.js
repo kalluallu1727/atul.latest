@@ -22,6 +22,7 @@ const { analyzeCustomerSpeech }                            = require("./decision
 const { generateEmbedding, searchKnowledge, generateSuggestedReply, generateGreeting } = require("./ragService");
 const { upload, extractText, chunkText }                   = require("./uploadService");
 const { runMigrations }                                    = require("./migrate");
+const authRoutes                                           = require("./authRoutes");
 require("dotenv").config({ quiet: true });
 
 // ── App + HTTP server ─────────────────────────────────────────
@@ -36,6 +37,9 @@ const corsOrigin = process.env.CORS_ORIGIN
 app.use(cors({ origin: corsOrigin }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// ── Auth module (new, independent — does not touch existing routes) ──
+app.use("/api/auth", authRoutes);
 
 // ── Env validation ────────────────────────────────────────────
 const {
