@@ -165,8 +165,9 @@ function customerConferenceTwiml(callId) {
 }
 
 function agentConferenceTwiml(callId) {
-  const transcriptionUrl = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
-  const room             = `room-${callId}`;
+  const transcriptionUrl   = escapeXml(`${BASE_URL}/api/transcription?call_id=${callId}&role=agent`);
+  const recordingStatusUrl = escapeXml(`${BASE_URL}/api/twilio/recording-status?call_id=${callId}`);
+  const room               = `room-${callId}`;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -176,7 +177,12 @@ function agentConferenceTwiml(callId) {
                    track="inbound_track" />
   </Start>
   <Dial>
-    <Conference beep="false" waitUrl="" endConferenceOnExit="true">
+    <Conference beep="false" waitUrl=""
+                endConferenceOnExit="true"
+                record="record-from-start"
+                recordingStatusCallback="${recordingStatusUrl}"
+                recordingStatusCallbackMethod="POST"
+                recordingStatusCallbackEvent="completed absent">
       ${room}
     </Conference>
   </Dial>
@@ -665,7 +671,9 @@ app.post("/api/twilio/ivr-noinput", async (req, res) => {
 });
 
 // -- Agent leg TwiML (called by Twilio when agent answers) ----
-app.post("/api/twilio/agent", async (req, res) => {
+// Recording starts automatically via record="record-from-start" in the TwiML.
+// Twilio fires recordingStatusCallback when recording completes.
+app.post("/api/twilio/agent", (req, res) => {
   res.set("Content-Type", "text/xml");
 
   const callId = String(req.query.call_id || "").trim();
@@ -673,53 +681,7 @@ app.post("/api/twilio/agent", async (req, res) => {
     return res.send("<Response><Hangup/></Response>");
   }
 
-  // Send TwiML immediately so the agent joins the conference without delay
   res.send(agentConferenceTwiml(callId));
-
-  // Start conference recording in the background.
-  // At this moment the customer is already waiting in the conference, so we
-  // can look it up by friendly name and start recording right away — no race
-  // condition, no timer, and the recording captures both parties from join.
-  if (!twilioClient) return;
-  (async () => {
-    try {
-      // Prevent duplicate recordings for the same call
-      const { data: existing } = await supabase
-        .from("recordings")
-        .select("id")
-        .eq("call_id", callId)
-        .maybeSingle();
-      if (existing) return;
-
-      const conferences = await twilioClient.conferences.list({
-        friendlyName: `room-${callId}`,
-        status:       "in-progress",
-        limit:        1,
-      });
-
-      if (!conferences.length) {
-        console.warn(`[recording] Conference room-${callId} not found or not in-progress`);
-        return;
-      }
-
-      const recording = await twilioClient
-        .conferences(conferences[0].sid)
-        .recordings.create({
-          recordingStatusCallback:       `${BASE_URL}/api/twilio/recording-status?call_id=${callId}`,
-          recordingStatusCallbackMethod: "POST",
-        });
-
-      console.log(`[recording] Started ✓ sid=${recording.sid} callId=${callId} conf=${conferences[0].sid}`);
-
-      await supabase.from("recordings").upsert({
-        call_id:       callId,
-        recording_sid: recording.sid,
-        status:        "in-progress",
-      }, { onConflict: "recording_sid" });
-    } catch (err) {
-      console.error("[recording] Start error:", err.message);
-    }
-  })();
 });
 
 // -- Outbound call: agent leg (TwiML App calls this when agent dials) -
