@@ -1201,6 +1201,49 @@ app.post("/api/twilio/recording-status", async (req, res) => {
   else console.log(`[recording] ${status} recording saved ✓ sid=${sid}`);
 });
 
+// -- Manual recording sync: pulls Twilio recordings into the DB ----------
+// Called from the dashboard "Sync" button when the webhook was missed.
+app.get("/api/recordings/sync", async (req, res) => {
+  if (!twilioClient) return res.status(503).json({ error: "Twilio not configured." });
+
+  try {
+    const recs = await twilioClient.recordings.list({ limit: 50 });
+    let synced = 0;
+
+    for (const rec of recs) {
+      if (!rec.conferenceSid) continue;
+
+      // Derive our internal callId from the conference friendly name (room-{callId})
+      let callId = null;
+      try {
+        const conf = await twilioClient.conferences(rec.conferenceSid).fetch();
+        const m = conf.friendlyName?.match(/^room-(.+)$/);
+        if (m) callId = m[1];
+      } catch { continue; }
+
+      if (!callId) continue;
+
+      const { error } = await supabase.from("recordings").upsert({
+        call_id:          callId,
+        recording_sid:    rec.sid,
+        recording_url:    rec.mediaUrl || null,
+        duration_seconds: rec.duration ? parseInt(String(rec.duration), 10) : null,
+        status:           rec.status,
+        completed_at:     rec.status === "completed" ? new Date().toISOString() : null,
+      }, { onConflict: "recording_sid" });
+
+      if (!error) synced++;
+      else console.error(`[recordings-sync] ${rec.sid}:`, error.message);
+    }
+
+    console.log(`[recordings-sync] Synced ${synced} of ${recs.length} recordings`);
+    return res.json({ ok: true, synced, total: recs.length });
+  } catch (err) {
+    console.error("[recordings-sync] Error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // -- Stream a Twilio recording to the browser (proxies with Basic Auth) --
 app.get("/api/recordings/stream/:sid", async (req, res) => {
   const { sid } = req.params;
