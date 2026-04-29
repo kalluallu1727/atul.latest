@@ -775,20 +775,51 @@ app.post("/api/twilio/outbound-customer", (req, res) => {
 
 // -- Conference status callback (called when conference ends) -
 app.post("/api/conference-status", (req, res) => {
-  const callId = String(req.query.call_id        || "").trim();
-  const event  = String(req.body.StatusCallbackEvent || "").trim();
+  res.status(200).end();
+
+  const callId        = String(req.query.call_id            || "").trim();
+  const event         = String(req.body.StatusCallbackEvent || "").trim();
+  const conferenceSid = String(req.body.ConferenceSid       || "").trim();
 
   if (event === "conference-end" && callId) {
-    console.log(`[conference-status] Conference ended callId=${callId}`);
+    console.log(`[conference-status] Conference ended callId=${callId} conferenceSid=${conferenceSid}`);
     supabase.from("calls").update({ status: "disconnected" })
       .eq("id", callId)
       .then(({ error }) => {
         if (error) console.error("[conference-status] Status update:", error.message);
         else console.log(`[conference-status] Call ${callId} marked disconnected ✓`);
       });
-  }
 
-  res.status(200).end();
+    // Fallback: if the recordingStatusCallback webhook was missed (e.g. wrong BASE_URL),
+    // query Twilio REST API directly after 90 s (enough time for encoding to finish).
+    if (twilioClient && conferenceSid) {
+      setTimeout(async () => {
+        try {
+          console.log(`[recording-sync] Querying Twilio for recordings conferenceSid=${conferenceSid}`);
+          const recs = await twilioClient.recordings.list({ conferenceSid, limit: 10 });
+          if (!recs.length) {
+            console.log(`[recording-sync] No recordings found for conferenceSid=${conferenceSid}`);
+            return;
+          }
+          for (const rec of recs) {
+            const { error } = await supabase.from("recordings").upsert({
+              call_id:          callId,
+              recording_sid:    rec.sid,
+              recording_url:    rec.mediaUrl || null,
+              duration_seconds: rec.duration ? parseInt(String(rec.duration), 10) : null,
+              status:           rec.status,
+              completed_at:     rec.status === "completed" ? new Date().toISOString() : null,
+            }, { onConflict: "recording_sid" });
+            if (error) console.error(`[recording-sync] Upsert error sid=${rec.sid}:`, error.message);
+            else console.log(`[recording-sync] Recording saved ✓ sid=${rec.sid} status=${rec.status}`);
+          }
+        } catch (err) {
+          console.error("[recording-sync] Twilio fetch error:", err.message);
+        }
+      }, 90_000);
+      console.log(`[recording-sync] Scheduled fallback recording sync in 90 s for callId=${callId}`);
+    }
+  }
 });
 
 // -- Fetch customer's recent bills from DB (graceful — works even if table missing) --
